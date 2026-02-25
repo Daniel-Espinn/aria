@@ -1,175 +1,361 @@
+
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
-import os
-import re
-import sqlite3
-import time
 import logging
-import smtplib
-import threading
-import asyncio
+import os
 import random
+import re
+import smtplib
 import string
+import threading
+import time
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+from typing import AsyncIterator, Dict, List, Optional
+
 import httpx
 import requests
+import stripe
 from bs4 import BeautifulSoup
-from urllib.parse import quote_plus
-from datetime import datetime, timezone, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from pathlib import Path
-from typing import Optional, Dict, List
-from collections import defaultdict
-
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-
-#GROQ
-from groq_api import call_groq_api, call_groq_stream
+from pydantic import BaseModel, EmailStr
+from sqlalchemy import (
+    Boolean, Column, DateTime, ForeignKey, Integer, String, Text,
+    create_engine, event, func, text,
+)
+from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
+from urllib.parse import quote_plus
 
 #load env
 from dotenv import load_dotenv
 load_dotenv()
 
-# Configurar logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ══════════════════════════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════════════════════════
+logging.basicConfig(level=logging.INFO, format="%(asctime)s │ %(levelname)s │ %(message)s")
 logger = logging.getLogger(__name__)
 
-# ═══════════════════════════ CONFIG ════════════════════════════
-OLLAMA_URL  = os.getenv("OLLAMA_URL",  "http://localhost:11434")
-MODEL_NAME  = os.getenv("ARIA_MODEL",  "qwen2.5:7b")
-DATA_DIR    = Path(os.getenv("ARIA_DATA", "aria_data"))
-DB_PATH     = DATA_DIR / "users.db"
-SECRET_KEY  = os.getenv("ARIA_SECRET", "CHANGE_ME_IN_PRODUCTION_aria_secret_key_2024")
+DATA_DIR   = Path(os.getenv("ARIA_DATA",   "aria_data"));  DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_URL     = os.getenv("ARIA_DB_URL",   f"sqlite:///{DATA_DIR}/aria.db")
+SECRET_KEY = os.getenv("ARIA_SECRET",   "CHANGE_ME_IN_PRODUCTION_2024")
+OLLAMA_URL = os.getenv("OLLAMA_URL",    "http://localhost:11434")
+MODEL_NAME = os.getenv("ARIA_MODEL",    "qwen2.5:7b")
 
-# Configuración SMTP (opcional)
-SMTP_HOST     = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_HOST     = os.getenv("SMTP_HOST",     "smtp.gmail.com")
 SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER     = os.getenv("SMTP_USER", "")
+SMTP_USER     = os.getenv("SMTP_USER",     "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SMTP_FROM     = os.getenv("SMTP_FROM", SMTP_USER)
+SMTP_FROM     = os.getenv("SMTP_FROM",     SMTP_USER)
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+STRIPE_SECRET_KEY       = os.getenv("STRIPE_SECRET_KEY",       "")
+STRIPE_WEBHOOK_SECRET   = os.getenv("STRIPE_WEBHOOK_SECRET",   "")
+STRIPE_PRICE_BASIC      = os.getenv("STRIPE_PRICE_BASIC",      "")   # price_xxx
+STRIPE_PRICE_PREMIUM    = os.getenv("STRIPE_PRICE_PREMIUM",    "")   # price_xxx
+FRONTEND_URL            = os.getenv("FRONTEND_URL",            "http://localhost:3000")
 
-app = FastAPI(title="ARIA API", version="2.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+
+# ── Plan quota definitions ────────────────────────────────────
+PLAN_QUOTAS: Dict[str, Dict] = {
+    "free": {
+        "daily_tokens":    10_000,   # tokens/day
+        "rpm":             5,        # requests per minute
+        "rpd":             20,       # requests per day
+        "label":           "Free",
+        "price_id":        None,
+    },
+    "basic": {
+        "daily_tokens":    100_000,
+        "rpm":             20,
+        "rpd":             200,
+        "label":           "Basic",
+        "price_id":        STRIPE_PRICE_BASIC,
+    },
+    "premium": {
+        "daily_tokens":    500_000,
+        "rpm":             60,
+        "rpd":             1000,
+        "label":           "Premium",
+        "price_id":        STRIPE_PRICE_PREMIUM,
+    },
+}
+
+# ══════════════════════════════════════════════════════════════
+#  DATABASE — SQLAlchemy
+# ══════════════════════════════════════════════════════════════
+engine = create_engine(
+    DB_URL,
+    connect_args={"check_same_thread": False} if "sqlite" in DB_URL else {},
+    echo=False,
 )
 
-bearer = HTTPBearer()
+# Enable WAL for SQLite (much better concurrent performance)
+@event.listens_for(engine, "connect")
+def set_sqlite_pragma(dbapi_conn, _):
+    if "sqlite" in DB_URL:
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
-# ═══════════════════════════ WEBSOCKET CONNECTIONS ══════════════════════
-active_connections: Dict[int, List[WebSocket]] = defaultdict(list)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-async def send_reminder_websocket(user_id: int, reminder_text: str, reminder_time: str) -> bool:
-    """Envía un recordatorio por WebSocket a todas las conexiones activas del usuario."""
-    if user_id not in active_connections or not active_connections[user_id]:
-        return False
-    message = {
-        "type": "reminder",
-        "data": {
-            "id": None,
-            "text": reminder_text,
-            "time": reminder_time
-        }
-    }
-    for connection in active_connections[user_id]:
-        try:
-            await connection.send_json(message)
-        except Exception as e:
-            logger.error(f"Error enviando WebSocket a usuario {user_id}: {e}")
-    return True
 
-# ═══════════════════════════ DATABASE ══════════════════════════
+class Base(DeclarativeBase):
+    pass
 
-INIT_SCRIPT = """
-    CREATE TABLE IF NOT EXISTS users (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        username    TEXT    UNIQUE NOT NULL,
-        email       TEXT    UNIQUE NOT NULL,
-        password    TEXT    NOT NULL,
-        plan        TEXT    NOT NULL DEFAULT 'free',
-        created_at  TEXT    NOT NULL,
-        last_login  TEXT
-    );
-    CREATE TABLE IF NOT EXISTS email_verifications (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        email       TEXT NOT NULL,
-        code        TEXT NOT NULL,
-        username    TEXT NOT NULL,
-        password    TEXT NOT NULL,
-        created_at  TEXT NOT NULL,
-        expires_at  TEXT NOT NULL,
-        verified    INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS reminders (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id       INTEGER NOT NULL,
-        reminder_text TEXT NOT NULL,
-        reminder_time TEXT NOT NULL,
-        recurrence    TEXT,
-        sent          INTEGER DEFAULT 0,
-        completed     INTEGER DEFAULT 0,
-        created_at    TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    );
-    CREATE TABLE IF NOT EXISTS web_search_cache (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        query      TEXT UNIQUE NOT NULL,
-        results    TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS notes (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id    INTEGER NOT NULL,
-        title      TEXT NOT NULL DEFAULT 'Note',
-        content    TEXT NOT NULL DEFAULT '',
-        color      TEXT NOT NULL DEFAULT '#6C63FF',
-        pinned     INTEGER DEFAULT 0,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    );
-    CREATE TABLE IF NOT EXISTS tasks (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id     INTEGER NOT NULL,
-        title       TEXT NOT NULL,
-        description TEXT DEFAULT '',
-        completed   INTEGER DEFAULT 0,
-        priority    TEXT DEFAULT 'medium',
-        due_date    TEXT,
-        created_at  TEXT NOT NULL,
-        updated_at  TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    );
-"""
+
+# ── Models ────────────────────────────────────────────────────
+class User(Base):
+    __tablename__ = "users"
+    id            = Column(Integer, primary_key=True, index=True)
+    username      = Column(String(64),  unique=True, nullable=False, index=True)
+    email         = Column(String(256), unique=True, nullable=False, index=True)
+    password      = Column(String(128), nullable=False)
+    plan          = Column(String(32),  nullable=False, default="free")
+    stripe_customer_id     = Column(String(128), nullable=True)
+    stripe_subscription_id = Column(String(128), nullable=True)
+    email_verified = Column(Boolean, default=False)
+    created_at    = Column(DateTime, default=datetime.utcnow)
+    last_login    = Column(DateTime, nullable=True)
+
+    reminders     = relationship("Reminder",          back_populates="user", cascade="all, delete-orphan")
+    notes         = relationship("Note",              back_populates="user", cascade="all, delete-orphan")
+    tasks         = relationship("Task",              back_populates="user", cascade="all, delete-orphan")
+    usage_logs    = relationship("UsageLog",          back_populates="user", cascade="all, delete-orphan")
+    rate_requests = relationship("RateRequest",       back_populates="user", cascade="all, delete-orphan")
+
+
+class EmailVerification(Base):
+    __tablename__ = "email_verifications"
+    id         = Column(Integer, primary_key=True)
+    email      = Column(String(256), nullable=False, index=True)
+    code       = Column(String(6),   nullable=False)
+    username   = Column(String(64),  nullable=False)
+    password   = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    verified   = Column(Boolean, default=False)
+
+
+class UsageLog(Base):
+    """Tracks token consumption per user per day."""
+    __tablename__  = "usage_logs"
+    id             = Column(Integer, primary_key=True)
+    user_id        = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    date           = Column(String(10), nullable=False, index=True)  # YYYY-MM-DD
+    tokens_used    = Column(Integer, default=0)
+    requests_count = Column(Integer, default=0)
+    user           = relationship("User", back_populates="usage_logs")
+
+
+class RateRequest(Base):
+    """Sliding-window rate limiting — stores per-minute request timestamps."""
+    __tablename__ = "rate_requests"
+    id         = Column(Integer, primary_key=True)
+    user_id    = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    ts         = Column(DateTime, default=datetime.utcnow, index=True)
+    user       = relationship("User", back_populates="rate_requests")
+
+
+class Reminder(Base):
+    __tablename__  = "reminders"
+    id             = Column(Integer, primary_key=True)
+    user_id        = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    reminder_text  = Column(Text,    nullable=False)
+    reminder_time  = Column(String(32), nullable=False)
+    recurrence     = Column(String(16), nullable=True)
+    sent           = Column(Boolean, default=False)
+    completed      = Column(Boolean, default=False)
+    created_at     = Column(DateTime, default=datetime.utcnow)
+    user           = relationship("User", back_populates="reminders")
+
+
+class Note(Base):
+    __tablename__ = "notes"
+    id         = Column(Integer, primary_key=True)
+    user_id    = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title      = Column(String(256), nullable=False, default="Note")
+    content    = Column(Text,        nullable=False, default="")
+    color      = Column(String(16),  nullable=False, default="#6C63FF")
+    pinned     = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    user       = relationship("User", back_populates="notes")
+
+
+class Task(Base):
+    __tablename__  = "tasks"
+    id             = Column(Integer, primary_key=True)
+    user_id        = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title          = Column(String(256), nullable=False)
+    description    = Column(Text,        nullable=False, default="")
+    completed      = Column(Boolean, default=False)
+    priority       = Column(String(16),  nullable=False, default="medium")
+    due_date       = Column(String(32),  nullable=True)
+    created_at     = Column(DateTime, default=datetime.utcnow)
+    updated_at     = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    user           = relationship("User", back_populates="tasks")
+
+
+class WebSearchCache(Base):
+    __tablename__ = "web_search_cache"
+    id         = Column(Integer, primary_key=True)
+    query      = Column(String(512), unique=True, nullable=False, index=True)
+    results    = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+Base.metadata.create_all(bind=engine)
+
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-def init_db():
-    conn = get_db()
-    conn.executescript(INIT_SCRIPT)
-    conn.commit()
-    conn.close()
 
-init_db()
+def get_db_sync() -> Session:
+    return SessionLocal()
 
-# ═══════════════════════════ AUTH ══════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+#  RATE LIMITING & QUOTA
+# ══════════════════════════════════════════════════════════════
+
+def check_rate_limit(user: User, db: Session) -> None:
+    """Raises 429 if the user exceeds RPM or RPD."""
+    quota   = PLAN_QUOTAS[user.plan]
+    now     = datetime.utcnow()
+    today   = now.date().isoformat()
+    minute_ago = now - timedelta(minutes=1)
+
+    # Requests in last minute
+    rpm_count = (
+        db.query(func.count(RateRequest.id))
+        .filter(RateRequest.user_id == user.id, RateRequest.ts >= minute_ago)
+        .scalar()
+    )
+    if rpm_count >= quota["rpm"]:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error":    "rate_limit_rpm",
+                "message":  f"Too many requests. Limit: {quota['rpm']} req/min for {quota['label']} plan.",
+                "limit":    quota["rpm"],
+                "plan":     user.plan,
+                "upgrade":  user.plan != "premium",
+            },
+        )
+
+    # Requests today
+    log = db.query(UsageLog).filter_by(user_id=user.id, date=today).first()
+    rpd_count = log.requests_count if log else 0
+    if rpd_count >= quota["rpd"]:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error":    "rate_limit_rpd",
+                "message":  f"Daily request limit reached ({quota['rpd']} req/day for {quota['label']} plan).",
+                "limit":    quota["rpd"],
+                "plan":     user.plan,
+                "upgrade":  user.plan != "premium",
+                "resets_at": (now + timedelta(days=1)).replace(hour=0, minute=0, second=0).isoformat(),
+            },
+        )
+
+    # Record this request
+    db.add(RateRequest(user_id=user.id, ts=now))
+
+    # Clean up old rate request entries (> 2 days)
+    db.query(RateRequest).filter(
+        RateRequest.user_id == user.id,
+        RateRequest.ts < now - timedelta(days=2),
+    ).delete()
+
+    db.commit()
+
+
+def check_token_quota(user: User, db: Session) -> int:
+    """Returns remaining tokens for today. Raises 429 if exhausted."""
+    quota = PLAN_QUOTAS[user.plan]
+    today = datetime.utcnow().date().isoformat()
+    log   = db.query(UsageLog).filter_by(user_id=user.id, date=today).first()
+    used  = log.tokens_used if log else 0
+    remaining = quota["daily_tokens"] - used
+    if remaining <= 0:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error":    "quota_exhausted",
+                "message":  f"Daily token quota exhausted ({quota['daily_tokens']:,} tokens for {quota['label']} plan).",
+                "limit":    quota["daily_tokens"],
+                "used":     used,
+                "plan":     user.plan,
+                "upgrade":  user.plan != "premium",
+                "resets_at": (datetime.utcnow() + timedelta(days=1)).replace(hour=0, minute=0, second=0).isoformat(),
+            },
+        )
+    return remaining
+
+
+def record_token_usage(user_id: int, tokens: int, db: Session) -> None:
+    today = datetime.utcnow().date().isoformat()
+    log   = db.query(UsageLog).filter_by(user_id=user_id, date=today).first()
+    if log:
+        log.tokens_used     += tokens
+        log.requests_count  += 1
+    else:
+        db.add(UsageLog(user_id=user_id, date=today, tokens_used=tokens, requests_count=1))
+    db.commit()
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token."""
+    return max(1, len(text) // 4)
+
+
+def get_usage_stats(user_id: int, db: Session) -> dict:
+    today  = datetime.utcnow().date().isoformat()
+    log    = db.query(UsageLog).filter_by(user_id=user_id, date=today).first()
+    used   = log.tokens_used    if log else 0
+    reqs   = log.requests_count if log else 0
+    user   = db.query(User).filter_by(id=user_id).first()
+    quota  = PLAN_QUOTAS[user.plan]
+    return {
+        "plan":              user.plan,
+        "daily_tokens":      quota["daily_tokens"],
+        "tokens_used":       used,
+        "tokens_remaining":  max(0, quota["daily_tokens"] - used),
+        "requests_today":    reqs,
+        "rpm_limit":         quota["rpm"],
+        "rpd_limit":         quota["rpd"],
+        "resets_at":         (datetime.utcnow() + timedelta(days=1)).replace(
+                                 hour=0, minute=0, second=0).isoformat(),
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+#  AUTH HELPERS
+# ══════════════════════════════════════════════════════════════
 
 def _hash_password(password: str) -> str:
     return hmac.new(SECRET_KEY.encode(), password.encode(), hashlib.sha256).hexdigest()
+
 
 def _make_token(user_id: int, username: str) -> str:
     import base64
@@ -178,610 +364,438 @@ def _make_token(user_id: int, username: str) -> str:
     sig = hmac.new(SECRET_KEY.encode(), b64.encode(), hashlib.sha256).hexdigest()[:16]
     return f"{b64}.{sig}"
 
+
 def _verify_token(token: str) -> dict:
     import base64
     try:
         b64, sig = token.rsplit(".", 1)
         expected = hmac.new(SECRET_KEY.encode(), b64.encode(), hashlib.sha256).hexdigest()[:16]
         if not hmac.compare_digest(sig, expected):
-            raise HTTPException(status_code=401, detail="Invalid token")
+            raise HTTPException(401, "Invalid token")
         payload = json.loads(base64.urlsafe_b64decode(b64 + "==").decode())
         if payload["exp"] < int(time.time()):
-            raise HTTPException(status_code=401, detail="Token expired")
+            raise HTTPException(401, "Token expired")
         return payload
     except (ValueError, KeyError, json.JSONDecodeError):
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(401, "Invalid token")
 
-def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> dict:
+
+bearer = HTTPBearer()
+
+
+def get_current_user(
+    creds: HTTPAuthorizationCredentials = Depends(bearer),
+    db: Session = Depends(get_db),
+) -> User:
     payload = _verify_token(creds.credentials)
-    conn = get_db()
-    row = conn.execute("SELECT * FROM users WHERE id = ?", (payload["id"],)).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(status_code=401, detail="User not found")
-    return dict(row)
+    user    = db.query(User).filter_by(id=payload["id"]).first()
+    if not user:
+        raise HTTPException(401, "User not found")
+    return user
 
-# ═══════════════════════════ WEBSOCKET AUTH ══════════════════════
-async def get_user_from_token(token: str) -> Optional[int]:
-    try:
-        payload = _verify_token(token)
-        return payload["id"]
-    except:
-        return None
 
-@app.websocket("/ws/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: int):
-    token = websocket.query_params.get("token")
-    if not token:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-    authenticated_user = await get_user_from_token(token)
-    if authenticated_user != user_id:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-
-    await websocket.accept()
-    active_connections[user_id].append(websocket)
-    logger.info(f"Usuario {user_id} conectado vía WebSocket")
-
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        active_connections[user_id].remove(websocket)
-        logger.info(f"Usuario {user_id} desconectado")
-        if not active_connections[user_id]:
-            del active_connections[user_id]
-
-# ═══════════════════════════ WEB SEARCH FUNCTIONS ══════════════════════
-
-def search_duckduckgo(query: str, num_results: int = 3) -> List[Dict[str, str]]:
-    """
-    Realiza una búsqueda en DuckDuckGo y devuelve una lista de resultados.
-    """
-    try:
-        # Usar DuckDuckGo HTML (gratuito, sin API key)
-        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        results = []
-        for result in soup.select('.result')[:num_results]:
-            title_elem = result.select_one('.result__a')
-            snippet_elem = result.select_one('.result__snippet')
-            url_elem = result.select_one('.result__url')
-            
-            if title_elem and url_elem:
-                title = title_elem.get_text(strip=True)
-                link = url_elem.get('href', '')
-                if link.startswith('/'):
-                    link = 'https://duckduckgo.com' + link
-                snippet = snippet_elem.get_text(strip=True) if snippet_elem else ''
-                
-                # Obtener contenido de la página (opcional, puede ralentizar)
-                page_content = fetch_webpage_content(link, max_length=500)
-                
-                results.append({
-                    'title': title,
-                    'link': link,
-                    'snippet': snippet,
-                    'content': page_content
-                })
-        
-        return results
-    except Exception as e:
-        logger.error(f"Error en búsqueda DuckDuckGo: {e}")
-        return []
-
-def fetch_webpage_content(url: str, max_length: int = 500) -> str:
-    """
-    Obtiene el contenido textual de una página web.
-    """
-    try:
-        response = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Eliminar scripts y estilos
-        for script in soup(['script', 'style']):
-            script.decompose()
-        
-        # Obtener texto
-        text = soup.get_text(separator=' ', strip=True)
-        # Limpiar espacios múltiples
-        text = ' '.join(text.split())
-        return text[:max_length] + ('...' if len(text) > max_length else '')
-    except Exception as e:
-        logger.error(f"Error obteniendo contenido de {url}: {e}")
-        return ""
-
-def get_cached_search(query: str, max_age_hours: int = 24) -> Optional[str]:
-    """Obtiene resultados de búsqueda cacheados si existen y no han expirado."""
-    conn = get_db()
-    cutoff = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
-    row = conn.execute(
-        "SELECT results FROM web_search_cache WHERE query = ? AND created_at > ?",
-        (query, cutoff)
-    ).fetchone()
-    conn.close()
-    return row['results'] if row else None
-
-def cache_search(query: str, results: str) -> None:
-    """Guarda resultados de búsqueda en caché."""
-    conn = get_db()
-    conn.execute(
-        "INSERT OR REPLACE INTO web_search_cache (query, results, created_at) VALUES (?, ?, ?)",
-        (query, results, datetime.now().isoformat())
-    )
-    conn.commit()
-    conn.close()
-
-def perform_web_search(query: str) -> str:
-    """
-    Realiza una búsqueda web y devuelve los resultados formateados como texto.
-    """
-    # Verificar caché
-    cached = get_cached_search(query)
-    if cached:
-        logger.info(f"Usando caché para búsqueda: {query}")
-        return cached
-
-    # Realizar búsqueda
-    logger.info(f"Realizando búsqueda web: {query}")
-    results = search_duckduckgo(query)
-    
-    if not results:
-        return "No se encontraron resultados para la búsqueda."
-    
-    # Formatear resultados
-    formatted = f"Resultados de búsqueda para: {query}\n\n"
-    for i, r in enumerate(results, 1):
-        formatted += f"{i}. {r['title']}\n"
-        formatted += f"   URL: {r['link']}\n"
-        formatted += f"   {r['snippet']}\n"
-        if r['content']:
-            formatted += f"   Contenido: {r['content']}\n"
-        formatted += "\n"
-    
-    # Guardar en caché
-    cache_search(query, formatted)
-    
-    return formatted
-
-# ═══════════════════════════ EMAIL VERIFICATION HELPERS ══════════════════════
+# ══════════════════════════════════════════════════════════════
+#  EMAIL
+# ══════════════════════════════════════════════════════════════
 
 def _generate_code() -> str:
-    return ''.join(random.choices(string.digits, k=6))
+    return "".join(random.choices(string.digits, k=6))
 
-def send_verification_email(email: str, code: str, username: str) -> bool:
+
+def _send_verification_email(email: str, code: str, username: str) -> bool:
     if not SMTP_USER or not SMTP_PASSWORD:
-        logger.warning("SMTP no configurado, omitiendo verificación de email")
-        return True  # En dev sin SMTP, auto-verificar
+        logger.warning("SMTP not configured — skipping email (dev mode)")
+        return True
     try:
-        msg = MIMEMultipart('alternative')
-        msg["From"]    = SMTP_FROM
-        msg["To"]      = email
-        msg["Subject"] = "🔐 Tu código de verificación ARIA"
-
-        html = f'''
-        <div style="font-family: -apple-system, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
-          <div style="text-align: center; margin-bottom: 32px;">
-            <h1 style="font-size: 28px; font-weight: 900; color: #6C63FF; letter-spacing: -1px; margin: 0;">ARIA</h1>
-            <p style="color: #8B8FA8; font-size: 13px; margin-top: 4px;">Adaptive Reasoning Intelligence Architecture</p>
-          </div>
-          <div style="background: #F8F8FF; border-radius: 16px; padding: 32px; text-align: center; border: 1px solid #E8E8F0;">
-            <p style="color: #2C2C3E; font-size: 16px; margin: 0 0 24px;">
-              Hola <strong>{username}</strong>, este es tu código de verificación:
-            </p>
-            <div style="background: #6C63FF; border-radius: 12px; padding: 20px 40px; display: inline-block;">
-              <span style="color: white; font-size: 36px; font-weight: 900; letter-spacing: 10px;">{code}</span>
+        msg          = MIMEMultipart("alternative")
+        msg["From"]  = SMTP_FROM
+        msg["To"]    = email
+        msg["Subject"] = "🔐 Your ARIA verification code"
+        html = f"""
+        <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px">
+          <h1 style="font-size:28px;font-weight:900;color:#6C63FF;letter-spacing:-1px;margin:0">ARIA</h1>
+          <p style="color:#8B8FA8;font-size:13px;margin-top:4px">Adaptive Reasoning Intelligence Architecture</p>
+          <div style="background:#F8F8FF;border-radius:16px;padding:32px;text-align:center;border:1px solid #E8E8F0;margin-top:24px">
+            <p style="color:#2C2C3E;font-size:15px;margin:0 0 20px">Hi <strong>{username}</strong>, your code is:</p>
+            <div style="background:#6C63FF;border-radius:12px;padding:18px 40px;display:inline-block">
+              <span style="color:white;font-size:36px;font-weight:900;letter-spacing:10px">{code}</span>
             </div>
-            <p style="color: #8B8FA8; font-size: 13px; margin: 24px 0 0;">
-              Expira en <strong>10 minutos</strong>. Si no solicitaste esto, ignora este correo.
-            </p>
+            <p style="color:#8B8FA8;font-size:12px;margin:20px 0 0">Expires in <strong>10 minutes</strong>.</p>
           </div>
-          <p style="color: #B0B3C1; font-size: 11px; text-align: center; margin-top: 24px;">
-            © 2024 ARIA by Evyox
-          </p>
-        </div>
-        '''
-        msg.attach(MIMEText(html, 'html'))
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
-
-        logger.info(f"Código de verificación enviado a {email}")
+        </div>"""
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.send_message(msg)
         return True
     except Exception as e:
-        logger.error(f"Error enviando verificación a {email}: {e}")
+        logger.error(f"Email error: {e}")
         return False
 
-# ═══════════════════════════ MEMORY ════════════════════════════
 
+def _send_reminder_email(email: str, text_: str, time_: str) -> bool:
+    if not SMTP_USER or not SMTP_PASSWORD:
+        return False
+    try:
+        msg          = MIMEMultipart()
+        msg["From"]  = SMTP_FROM
+        msg["To"]    = email
+        msg["Subject"] = "🔔 ARIA Reminder"
+        html = f"<h2>Reminder</h2><p><strong>{text_}</strong></p><p>Scheduled: {time_}</p>"
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.send_message(msg)
+        return True
+    except Exception as e:
+        logger.error(f"Reminder email error: {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════
+#  WEBSOCKET
+# ══════════════════════════════════════════════════════════════
+active_connections: Dict[int, List[WebSocket]] = defaultdict(list)
+
+
+async def _ws_send_reminder(user_id: int, text_: str, time_: str) -> bool:
+    if user_id not in active_connections or not active_connections[user_id]:
+        return False
+    msg = {"type": "reminder", "data": {"id": None, "text": text_, "time": time_}}
+    for ws in active_connections[user_id]:
+        try:
+            await ws.send_json(msg)
+        except Exception as e:
+            logger.error(f"WS send error: {e}")
+    return True
+
+
+# ══════════════════════════════════════════════════════════════
+#  MEMORY STORE (file-based, unchanged)
+# ══════════════════════════════════════════════════════════════
 class MemoryStore:
     def __init__(self, user_id: int, username: str):
-        self.user_dir   = DATA_DIR / f"user_{user_id}_{username}"
-        self.memory_dir = self.user_dir / "memory"
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
-        self.memory_file  = self.memory_dir / "MEMORY.md"
-        self.history_file = self.memory_dir / "HISTORY.md"
-        self._init_files()
+        d = DATA_DIR / f"user_{user_id}_{username}" / "memory"
+        d.mkdir(parents=True, exist_ok=True)
+        self.memory_file  = d / "MEMORY.md"
+        self.history_file = d / "HISTORY.md"
+        self._init()
 
-    def _init_files(self):
+    def _init(self):
         if not self.memory_file.exists():
             self.memory_file.write_text(
-                "# ARIA Long-Term Memory\n\n"
-                "## User Information\n\n"
-                "## Preferences\n\n"
-                "## Ongoing Tasks\n\n"
-                "## Important Notes\n\n",
-                encoding="utf-8",
-            )
+                "# ARIA Long-Term Memory\n\n## User Information\n\n"
+                "## Preferences\n\n## Ongoing Tasks\n\n## Important Notes\n\n",
+                encoding="utf-8")
         if not self.history_file.exists():
             self.history_file.write_text("# ARIA Conversation History\n\n", encoding="utf-8")
 
-    def read_memory(self) -> str:
-        return self.memory_file.read_text(encoding="utf-8")
+    def read_memory(self)  -> str: return self.memory_file.read_text(encoding="utf-8")
+    def write_memory(self, c: str): self.memory_file.write_text(c, encoding="utf-8")
 
-    def write_memory(self, content: str) -> None:
-        self.memory_file.write_text(content, encoding="utf-8")
+    def patch_memory(self, old: str, new: str) -> bool:
+        cur = self.read_memory()
+        if old not in cur: return False
+        self.write_memory(cur.replace(old, new, 1)); return True
 
-    def patch_memory(self, old_text: str, new_text: str) -> bool:
-        current = self.read_memory()
-        if old_text not in current:
-            return False
-        self.write_memory(current.replace(old_text, new_text, 1))
-        return True
-
-    def append_history(self, user_msg: str, aria_msg: str) -> None:
+    def append_history(self, user_msg: str, aria_msg: str):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        entry = f"[{ts}]\nUSER: {user_msg}\nARIA: {aria_msg}\n\n---\n\n"
         with open(self.history_file, "a", encoding="utf-8") as f:
-            f.write(entry)
+            f.write(f"[{ts}]\nUSER: {user_msg}\nARIA: {aria_msg}\n\n---\n\n")
 
     def read_history(self, last_n: int = 20) -> str:
-        if not self.history_file.exists():
-            return ""
-        text = self.history_file.read_text(encoding="utf-8")
+        text    = self.history_file.read_text(encoding="utf-8")
         entries = text.split("---\n\n")
-        recent = entries[-last_n:] if len(entries) > last_n else entries
-        return "---\n\n".join(recent).strip()
+        return "---\n\n".join(entries[-last_n:]).strip()
 
-# ═══════════════════════════ REMINDER FUNCTIONS ══════════════════════
 
-def send_reminder_email(user_email: str, reminder_text: str, reminder_time: str) -> bool:
-    if not SMTP_USER or not SMTP_PASSWORD:
-        return False
+# ══════════════════════════════════════════════════════════════
+#  WEB SEARCH
+# ══════════════════════════════════════════════════════════════
+def _search_duckduckgo(query: str, n: int = 3) -> list:
     try:
-        msg = MIMEMultipart()
-        msg["From"] = SMTP_FROM
-        msg["To"] = user_email
-        msg["Subject"] = "🔔 Recordatorio de ARIA"
-
-        body = f"""
-        <h2>Recordatorio</h2>
-        <p><strong>{reminder_text}</strong></p>
-        <p>Hora programada: {reminder_time}</p>
-        <hr>
-        <p>Atentamente,<br>Tu asistente ARIA</p>
-        """
-        msg.attach(MIMEText(body, "html"))
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
-
-        logger.info(f"Correo enviado a {user_email}: {reminder_text}")
-        return True
+        url  = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        hdrs = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, headers=hdrs, timeout=10)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        out  = []
+        for r in soup.select(".result")[:n]:
+            ta = r.select_one(".result__a")
+            ts = r.select_one(".result__snippet")
+            tu = r.select_one(".result__url")
+            if ta and tu:
+                link    = tu.get("href", "")
+                if link.startswith("/"): link = "https://duckduckgo.com" + link
+                snippet = ts.get_text(strip=True) if ts else ""
+                content = _fetch_page(link)
+                out.append({"title": ta.get_text(strip=True), "link": link,
+                             "snippet": snippet, "content": content})
+        return out
     except Exception as e:
-        logger.error(f"Error enviando correo a {user_email}: {e}")
-        return False
+        logger.error(f"DuckDuckGo error: {e}")
+        return []
 
-def create_reminder(user_id: int, reminder_text: str, reminder_time: str, recurrence: Optional[str] = None) -> None:
-    conn = get_db()
-    conn.execute(
-        """INSERT INTO reminders 
-           (user_id, reminder_text, reminder_time, recurrence, created_at) 
-           VALUES (?, ?, ?, ?, ?)""",
-        (user_id, reminder_text, reminder_time, recurrence, datetime.now().isoformat())
-    )
-    conn.commit()
-    conn.close()
-    logger.info(f"Recordatorio guardado para usuario {user_id}: {reminder_text} a las {reminder_time} (recurrencia: {recurrence})")
 
-def get_pending_reminders(user_id: int) -> list[dict]:
-    conn = get_db()
-    now = datetime.now().isoformat()
-    rows = conn.execute(
-        """SELECT id, reminder_text, reminder_time, recurrence 
-           FROM reminders 
-           WHERE user_id = ? AND sent = 0 AND completed = 0 AND reminder_time <= ?""",
-        (user_id, now)
-    ).fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
+def _fetch_page(url: str, max_len: int = 500) -> str:
+    try:
+        r    = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style"]): tag.decompose()
+        text = " ".join(soup.get_text(separator=" ", strip=True).split())
+        return text[:max_len] + ("..." if len(text) > max_len else "")
+    except Exception:
+        return ""
 
-def mark_reminder_sent(reminder_id: int) -> None:
-    conn = get_db()
-    conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
-    conn.commit()
-    conn.close()
 
-def complete_reminder(reminder_id: int) -> None:
-    """Marca un recordatorio como completado y genera el siguiente si es recurrente."""
-    conn = get_db()
-    row = conn.execute("SELECT user_id, reminder_text, reminder_time, recurrence FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
-    if not row:
-        conn.close()
-        return
-    user_id = row["user_id"]
-    text = row["reminder_text"]
-    time_str = row["reminder_time"]
-    recurrence = row["recurrence"]
+def perform_web_search(query: str, db: Session) -> str:
+    cutoff = datetime.utcnow() - timedelta(hours=24)
+    cached = db.query(WebSearchCache).filter(
+        WebSearchCache.query == query,
+        WebSearchCache.created_at >= cutoff,
+    ).first()
+    if cached:
+        return cached.results
 
-    conn.execute("UPDATE reminders SET completed = 1 WHERE id = ?", (reminder_id,))
-    conn.commit()
+    results = _search_duckduckgo(query)
+    if not results:
+        return "No results found."
+    fmt = f"Search results for: {query}\n\n"
+    for i, r in enumerate(results, 1):
+        fmt += f"{i}. {r['title']}\n   URL: {r['link']}\n   {r['snippet']}\n"
+        if r["content"]: fmt += f"   Content: {r['content']}\n"
+        fmt += "\n"
 
-    if recurrence:
-        try:
-            current_time = datetime.fromisoformat(time_str)
-            if recurrence == "daily":
-                next_time = current_time + timedelta(days=1)
-            elif recurrence == "weekly":
-                next_time = current_time + timedelta(weeks=1)
-            elif recurrence == "monthly":
-                next_time = current_time + timedelta(days=30)
-            else:
-                next_time = None
-            if next_time:
-                next_time_str = next_time.isoformat()
-                conn.execute(
-                    """INSERT INTO reminders (user_id, reminder_text, reminder_time, recurrence, created_at)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (user_id, text, next_time_str, recurrence, datetime.now().isoformat())
-                )
-                conn.commit()
-                logger.info(f"Nuevo recordatorio recurrente creado para usuario {user_id}: {text} a las {next_time_str}")
-        except Exception as e:
-            logger.error(f"Error creando siguiente recordatorio recurrente: {e}")
-    conn.close()
+    entry = db.query(WebSearchCache).filter_by(query=query).first()
+    if entry:
+        entry.results    = fmt
+        entry.created_at = datetime.utcnow()
+    else:
+        db.add(WebSearchCache(query=query, results=fmt))
+    db.commit()
+    return fmt
 
-def check_and_send_reminders_background():
-    """
-    Worker que cada 60 segundos revisa recordatorios pendientes.
-    """
-    logger.info("Worker de recordatorios iniciado")
-    while True:
-        try:
-            conn = get_db()
-            rows = conn.execute(
-                """SELECT r.id, r.reminder_text, r.reminder_time, 
-                          u.id as user_id, u.email 
-                   FROM reminders r 
-                   JOIN users u ON r.user_id = u.id 
-                   WHERE r.sent = 0 AND r.completed = 0 AND r.reminder_time <= ?""",
-                (datetime.now().isoformat(),)
-            ).fetchall()
-            conn.close()
 
-            for row in rows:
-                reminder_id = row["id"]
-                user_id = row["user_id"]
-                email = row["email"]
-                text = row["reminder_text"]
-                time_str = row["reminder_time"]
-
-                # Intentar WebSocket
-                sent_ws = False
-                if user_id in active_connections and active_connections[user_id]:
-                    loop = asyncio.get_event_loop()
-                    future = asyncio.run_coroutine_threadsafe(
-                        send_reminder_websocket(user_id, text, time_str),
-                        loop
-                    )
-                    try:
-                        sent_ws = future.result(timeout=5)
-                    except Exception as e:
-                        logger.error(f"Error enviando WebSocket a usuario {user_id}: {e}")
-
-                if sent_ws:
-                    mark_reminder_sent(reminder_id)
-                    logger.info(f"Recordatorio {reminder_id} enviado por WebSocket a usuario {user_id}")
-                    continue
-
-                if email:
-                    sent_email = send_reminder_email(email, text, time_str)
-                    if sent_email:
-                        mark_reminder_sent(reminder_id)
-                        continue
-
-                logger.info(f"Recordatorio {reminder_id} pendiente (usuario {user_id} no conectado, sin correo)")
-
-        except Exception as e:
-            logger.error(f"Error en worker de recordatorios: {e}")
-
-        time.sleep(60)
-
-def check_and_send_reminders_in_chat(user_id: int, current_response: str) -> str:
-    """
-    Busca recordatorios pendientes y los agrega a la respuesta del chat.
-    """
-    pending = get_pending_reminders(user_id)
-    if not pending:
-        return current_response
-
-    reminder_messages = []
-    for rem in pending:
-        try:
-            dt = datetime.fromisoformat(rem["reminder_time"])
-            time_str = dt.strftime("%Y-%m-%d %H:%M")
-        except:
-            time_str = rem["reminder_time"]
-        reminder_messages.append(
-            f"🔔 **Recordatorio ({time_str})**: {rem['reminder_text']}\n\n"
-            f"_[Confirma que lo has leído haciendo clic aquí](javascript:confirmReminder({rem['id']}))_"
-        )
-        mark_reminder_sent(rem["id"])
-
-    if reminder_messages:
-        separator = "\n\n---\n\n" if current_response else ""
-        return current_response + separator + "\n\n".join(reminder_messages)
-    return current_response
-
-# Iniciar worker
-threading.Thread(target=check_and_send_reminders_background, daemon=True).start()
-
-# ═══════════════════════════ SYSTEM PROMPT ══════════════════════
-
-def build_system_prompt(user: dict, mem: MemoryStore) -> str:
-    now = datetime.now()
-    current_time_str = now.strftime("%Y-%m-%d %H:%M (%A) %Z")
-    memory_md = mem.read_memory()
-    recent_history = mem.read_history(last_n=10)
-
+# ══════════════════════════════════════════════════════════════
+#  SYSTEM PROMPT & ACTION PARSER
+# ══════════════════════════════════════════════════════════════
+def build_system_prompt(user: User, mem: MemoryStore) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
     return f"""### ROLE: ARIA
-You are ARIA, an advanced AI Assistant with persistent cognitive architecture. Created by Evyox (2024).
-Your goal is to assist the user while evolving your knowledge base through active memory management.
+You are ARIA, an advanced AI assistant with persistent memory, reminders, and web search. Created by Evyox (2024).
+Current time: {now} | User: {user.username} (Plan: {user.plan})
 
-### CONTEXT
-- **Current Time:** {current_time_str}
-- **User:** {user['username']} (Plan: {user['plan']})
+### LONG-TERM MEMORY
+{mem.read_memory()}
 
-### 🧠 LONG-TERM MEMORY (MEMORY.md)
-This is your current knowledge about the user. Read it carefully before responding:
----
-{memory_md}
----
+### RECENT HISTORY
+{mem.read_history(last_n=10)}
 
-### 💬 RECENT CONVERSATION HISTORY
-{recent_history}
+### PROTOCOLS
+1. Update memory when user shares important info. Use <ARIA_ACTION> at the END of your response.
+2. Set reminders with ISO 8601 datetime.
+3. Search web for current info with SEARCH_WEB:query
+4. NEVER show <ARIA_ACTION> JSON to user.
 
-### 🛠 MANDATORY OPERATIONAL PROTOCOLS
+### ACTION SYNTAX
+<ARIA_ACTION>{{"action":"patch_memory","old_text":"...","new_text":"..."}}</ARIA_ACTION>
+<ARIA_ACTION>{{"action":"append_note","content":"..."}}</ARIA_ACTION>
+<ARIA_ACTION>{{"action":"set_reminder","reminder_text":"...","reminder_time":"ISO8601","recurrence":"daily"}}</ARIA_ACTION>
+SEARCH_WEB:your query here"""
 
-1. **MEMORY EVOLUTION (CRITICAL):** If the user provides new info (name, age, job, preferences, goals) or you complete a task, you **MUST** update MEMORY.md. 
-   - Use `patch_memory` to update specific lines (best for names/preferences).
-   - Use `append_note` for general facts.
-   - **Format:** The JSON block must be the ABSOLUTE LAST thing in your message. No text after it.
 
-2. **REASONING BEFORE ACTION:**
-   Internalize: "Does this message contain info worth remembering?" If yes, prepare the `<ARIA_ACTION>` block.
+def parse_and_apply_action(raw: str, user_id: int, mem: MemoryStore, db: Session) -> tuple[str, bool]:
+    # Web search
+    for query in re.findall(r"SEARCH_WEB:(.*?)(?:\n|$)", raw, re.IGNORECASE):
+        q = query.strip()
+        if q:
+            results = perform_web_search(q, db)
+            raw = raw.replace(f"SEARCH_WEB:{q}", f"[Search: {q}]\n{results}")
 
-3. **ACTION SYNTAX:**
-   - **patch_memory:** Requires `old_text` (exact match) and `new_text`.
-   - **append_note:** Requires `content`.
-   - **set_reminder:** Requires `reminder_text` and `reminder_time` (ISO 8601).
-
-4. **FORBIDDEN:** - Do NOT show the JSON block to the user. 
-   - Do NOT use Markdown code blocks (```json) inside `<ARIA_ACTION>`. Use raw JSON.
-
-### ACTION EXAMPLES (FOR INTERNAL USE)
-
-- **User says:** "I am a Flutter developer."
-  **Response:** "That's great! I've updated your profile."
-  <ARIA_ACTION>{{"action": "patch_memory", "old_text": "## User Information\\n\\n", "new_text": "## User Information\\n- Role: Flutter Developer\\n"}}</ARIA_ACTION>
-
-- **User says:** "Remember that I like dark coffee."
-  **Response:** "Noted. I'll remember that."
-  <ARIA_ACTION>{{"action": "append_note", "content": "User prefers dark coffee"}}</ARIA_ACTION>
-
-- **User says:** "Search for NVIDIA stock price."
-  **Response:** "Searching... SEARCH_WEB:NVIDIA stock price"
-
-### 🚀 COMMAND RECAP
-- Memory: `<ARIA_ACTION>{{"action": "...", ...}}</ARIA_ACTION>`
-- Search: `SEARCH_WEB:query`
-- Time: `[CURRENT_TIME]`
-
-Begin your response now. Use your tools wisely."""
-
-# ═══════════════════════════ ACTION PARSER ═════════════════════
-
-def parse_and_apply_action(raw: str, user_id: int, mem: MemoryStore) -> tuple[str, bool]:
-    # Buscar y ejecutar comandos SEARCH_WEB
-    search_pattern = r'SEARCH_WEB:(.*?)(?:\n|$)'
-    search_matches = re.findall(search_pattern, raw, re.IGNORECASE)
-    
-    for query in search_matches:
-        query = query.strip()
-        if query:
-            logger.info(f"Ejecutando búsqueda web: {query}")
-            search_results = perform_web_search(query)
-            # Reemplazar el comando con los resultados
-            raw = raw.replace(f"SEARCH_WEB:{query}", f"[Resultados de búsqueda: {query}]\n{search_results}")
-
-    # Procesar acciones ARIA
-    pattern = r"<ARIA_ACTION>(.*?)</ARIA_ACTION>"
-    match = re.search(pattern, raw, re.DOTALL)
+    match = re.search(r"<ARIA_ACTION>(.*?)</ARIA_ACTION>", raw, re.DOTALL)
     if not match:
         return raw.strip(), False
 
-    clean = (raw[: match.start()] + raw[match.end():]).strip()
-    action_text = match.group(1).strip()
-
+    clean = (raw[:match.start()] + raw[match.end():]).strip()
     try:
-        data = json.loads(action_text)
+        data   = json.loads(match.group(1).strip())
         action = data.get("action", "")
-
         if action == "write_memory":
-            content = data.get("content", "")
-            if content:
-                mem.write_memory(content)
-                return clean, True
-
+            mem.write_memory(data.get("content", ""))
         elif action == "patch_memory":
-            old = data.get("old_text", "")
-            new = data.get("new_text", "")
-            if old:
-                mem.patch_memory(old, new)
-                return clean, True
-
+            mem.patch_memory(data.get("old_text", ""), data.get("new_text", ""))
         elif action == "append_note":
-            content = data.get("content", "")
-            if content:
-                current = mem.read_memory()
-                section = "## Important Notes\n\n"
-                if section in current:
-                    updated = current.replace(
-                        section,
-                        section + f"- {content}\n",
-                        1,
-                    )
-                    mem.write_memory(updated)
-                return clean, True
-
+            c = mem.read_memory()
+            sec = "## Important Notes\n\n"
+            if sec in c:
+                mem.write_memory(c.replace(sec, sec + f"- {data['content']}\n", 1))
         elif action == "set_reminder":
-            reminder_text = data.get("reminder_text", "")
-            reminder_time = data.get("reminder_time", "")
-            recurrence = data.get("recurrence")
-            if reminder_text and reminder_time:
-                create_reminder(user_id, reminder_text, reminder_time, recurrence)
-                return clean, True
+            db.add(Reminder(
+                user_id=user_id,
+                reminder_text=data["reminder_text"],
+                reminder_time=data["reminder_time"],
+                recurrence=data.get("recurrence"),
+            ))
+            db.commit()
+        return clean, True
+    except Exception as e:
+        logger.error(f"Action parse error: {e}")
+        return clean, False
 
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.error(f"Error parsing action: {e}")
 
-    return clean, False
+def check_and_inject_reminders(user_id: int, response: str, db: Session) -> str:
+    now  = datetime.now().isoformat()
+    rows = db.query(Reminder).filter(
+        Reminder.user_id  == user_id,
+        Reminder.sent     == False,
+        Reminder.completed == False,
+        Reminder.reminder_time <= now,
+    ).all()
+    if not rows: return response
+    msgs = []
+    for r in rows:
+        try: ts = datetime.fromisoformat(r.reminder_time).strftime("%Y-%m-%d %H:%M")
+        except: ts = r.reminder_time
+        msgs.append(f"🔔 **Reminder ({ts})**: {r.reminder_text}")
+        r.sent = True
+    db.commit()
+    sep = "\n\n---\n\n" if response else ""
+    return response + sep + "\n\n".join(msgs)
 
-# ═══════════════════════════ SCHEMAS ════════════════════════════
 
+# ══════════════════════════════════════════════════════════════
+#  REMINDER BACKGROUND WORKER
+# ══════════════════════════════════════════════════════════════
+def _reminder_worker():
+    logger.info("Reminder worker started")
+    while True:
+        try:
+            db   = get_db_sync()
+            now  = datetime.now().isoformat()
+            rows = (
+                db.query(Reminder)
+                .join(User)
+                .filter(Reminder.sent == False, Reminder.completed == False,
+                        Reminder.reminder_time <= now)
+                .all()
+            )
+            for r in rows:
+                user = r.user
+                sent_ws = False
+                if user.id in active_connections:
+                    loop = asyncio.get_event_loop()
+                    fut  = asyncio.run_coroutine_threadsafe(
+                        _ws_send_reminder(user.id, r.reminder_text, r.reminder_time), loop)
+                    try:    sent_ws = fut.result(timeout=5)
+                    except: pass
+                if not sent_ws and user.email:
+                    _send_reminder_email(user.email, r.reminder_text, r.reminder_time)
+                r.sent = True
+                # Handle recurrence
+                if r.recurrence:
+                    try:
+                        dt = datetime.fromisoformat(r.reminder_time)
+                        delta = {"daily": timedelta(days=1), "weekly": timedelta(weeks=1),
+                                 "monthly": timedelta(days=30)}.get(r.recurrence)
+                        if delta:
+                            db.add(Reminder(
+                                user_id=r.user_id,
+                                reminder_text=r.reminder_text,
+                                reminder_time=(dt + delta).isoformat(),
+                                recurrence=r.recurrence,
+                            ))
+                    except Exception as e:
+                        logger.error(f"Recurrence error: {e}")
+            db.commit()
+            db.close()
+        except Exception as e:
+            logger.error(f"Reminder worker error: {e}")
+        time.sleep(60)
+
+
+threading.Thread(target=_reminder_worker, daemon=True).start()
+
+# ══════════════════════════════════════════════════════════════
+#  GROQ STREAMING (with fallback to Ollama)
+# ══════════════════════════════════════════════════════════════
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.1-70b-versatile")
+
+
+async def stream_groq(messages: list, system: str) -> AsyncIterator[str]:
+    """Stream from Groq API. Raises on failure."""
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY not set")
+    async with httpx.AsyncClient(timeout=180) as c:
+        async with c.stream(
+            "POST",
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model":       GROQ_MODEL,
+                "messages":    [{"role": "system", "content": system}] + messages,
+                "stream":      True,
+                "temperature": 0.1,
+                "max_tokens":  4096,
+            },
+        ) as r:
+            if r.status_code != 200:
+                body = await r.aread()
+                raise ValueError(f"Groq error {r.status_code}: {body.decode()[:200]}")
+            async for line in r.aiter_lines():
+                if not line.startswith("data: "): continue
+                data = line[6:]
+                if data == "[DONE]": break
+                try:
+                    chunk = json.loads(data)
+                    token = chunk["choices"][0]["delta"].get("content", "")
+                    if token: yield token
+                except Exception: continue
+
+
+async def stream_ollama(messages: list, system: str) -> AsyncIterator[str]:
+    """Stream from local Ollama."""
+    payload = {
+        "model":    MODEL_NAME,
+        "messages": [{"role": "system", "content": system}] + messages,
+        "stream":   True,
+        "options":  {"temperature": 0.1, "top_p": 0.9},
+    }
+    async with httpx.AsyncClient(timeout=180) as c:
+        async with c.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as r:
+            async for line in r.aiter_lines():
+                if not line.strip(): continue
+                try:
+                    chunk = json.loads(line)
+                    token = chunk.get("message", {}).get("content", "")
+                    if token: yield token
+                    if chunk.get("done"): break
+                except Exception: continue
+
+
+async def stream_ai(messages: list, system: str) -> AsyncIterator[str]:
+    """Try Groq first, fall back to Ollama."""
+    try:
+        async for token in stream_groq(messages, system):
+            yield token
+    except Exception as e:
+        logger.warning(f"Groq failed ({e}), falling back to Ollama")
+        async for token in stream_ollama(messages, system):
+            yield token
+
+
+# ══════════════════════════════════════════════════════════════
+#  PYDANTIC SCHEMAS
+# ══════════════════════════════════════════════════════════════
 class RegisterRequest(BaseModel):
     username: str
-    email: str
-    password: str
-
-class RegisterRequestV2(BaseModel):
-    username: str
-    email: str
+    email:    str
     password: str
 
 class VerifyEmailRequest(BaseModel):
     email: str
-    code: str
+    code:  str
 
 class LoginRequest(BaseModel):
     username: str
@@ -821,465 +835,510 @@ class TaskUpdateRequest(BaseModel):
     description: Optional[str]  = None
     completed:   Optional[bool] = None
     priority:    Optional[str]  = None
-    due_date:    Optional[str] = None
+    due_date:    Optional[str]  = None
 
-# ═══════════════════════════ AUTH ROUTES ═══════════════════════
+class CheckoutRequest(BaseModel):
+    plan: str  # "basic" or "premium"
 
-@app.post("/auth/register")
-async def register(req: RegisterRequest):
-    # Validaciones básicas
-    if len(req.username) < 3:
-        raise HTTPException(400, "Username must be at least 3 characters")
-    if len(req.password) < 6:
-        raise HTTPException(400, "Password must be at least 6 characters")
-    if "@" not in req.email or "." not in req.email.split("@")[-1]:
-        raise HTTPException(400, "Invalid email")
+# ══════════════════════════════════════════════════════════════
+#  APP
+# ══════════════════════════════════════════════════════════════
+app = FastAPI(title="ARIA API", version="3.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
 
-    # Verificar que no existe ya el usuario
-    conn = get_db()
-    existing = conn.execute(
-        "SELECT id FROM users WHERE username = ? OR email = ?",
-        (req.username.lower(), req.email.lower())
-    ).fetchone()
-    conn.close()
-    if existing:
-        raise HTTPException(400, "Username or email already exists")
 
-    # Generar código y guardarlo
-    code    = _generate_code()
-    now     = datetime.now()
-    expires = (now + timedelta(minutes=10)).isoformat()
-
-    conn = get_db()
-    # Borrar intentos previos del mismo email
-    conn.execute("DELETE FROM email_verifications WHERE email = ?", (req.email.lower(),))
-    conn.execute(
-        """INSERT INTO email_verifications 
-           (email, code, username, password, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (req.email.lower(), code, req.username.lower(),
-         _hash_password(req.password), now.isoformat(), expires)
+# ── Global error handler ──────────────────────────────────────
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled error: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An unexpected error occurred. Please try again."},
     )
-    conn.commit()
-    conn.close()
 
-    # Enviar email
-    sent = send_verification_email(req.email, code, req.username)
-    if not sent:
-        raise HTTPException(500, "Could not send verification email")
 
+# ── WebSocket ─────────────────────────────────────────────────
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: int):
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION); return
+    try:
+        payload = _verify_token(token)
+    except Exception:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION); return
+    if payload["id"] != user_id:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION); return
+
+    await websocket.accept()
+    active_connections[user_id].append(websocket)
+    logger.info(f"WS connected: user {user_id}")
+    try:
+        while True: await websocket.receive_text()
+    except WebSocketDisconnect:
+        active_connections[user_id].remove(websocket)
+        if not active_connections[user_id]: del active_connections[user_id]
+
+
+# ══════════════════════════════════════════════════════════════
+#  AUTH ROUTES
+# ══════════════════════════════════════════════════════════════
+@app.post("/auth/register")
+async def register(req: RegisterRequest, db: Session = Depends(get_db)):
+    if len(req.username) < 3:    raise HTTPException(400, "Username must be ≥ 3 chars")
+    if len(req.password) < 6:    raise HTTPException(400, "Password must be ≥ 6 chars")
+    if "@" not in req.email:     raise HTTPException(400, "Invalid email")
+
+    exists = db.query(User).filter(
+        (User.username == req.username.lower()) | (User.email == req.email.lower())
+    ).first()
+    if exists: raise HTTPException(400, "Username or email already exists")
+
+    code    = _generate_code()
+    expires = datetime.utcnow() + timedelta(minutes=10)
+    db.query(EmailVerification).filter_by(email=req.email.lower()).delete()
+    db.add(EmailVerification(
+        email=req.email.lower(), code=code,
+        username=req.username.lower(), password=_hash_password(req.password),
+        expires_at=expires,
+    ))
+    db.commit()
+
+    sent = _send_verification_email(req.email, code, req.username)
+    if not sent: raise HTTPException(500, "Could not send verification email")
     return {"status": "verification_sent", "email": req.email.lower()}
 
+
 @app.post("/auth/verify-email")
-async def verify_email(req: VerifyEmailRequest):
-    conn = get_db()
-    row = conn.execute(
-        """SELECT * FROM email_verifications 
-           WHERE email = ? AND code = ? AND verified = 0""",
-        (req.email.lower(), req.code.strip())
-    ).fetchone()
+async def verify_email(req: VerifyEmailRequest, db: Session = Depends(get_db)):
+    v = db.query(EmailVerification).filter_by(
+        email=req.email.lower(), code=req.code.strip(), verified=False).first()
+    if not v:                          raise HTTPException(400, "Invalid or expired code")
+    if v.expires_at < datetime.utcnow():
+        db.delete(v); db.commit();     raise HTTPException(400, "Code expired, please register again")
 
-    if not row:
-        conn.close()
-        raise HTTPException(400, "Invalid or expired code")
-
-    # Verificar expiración
-    if datetime.fromisoformat(row["expires_at"]) < datetime.now():
-        conn.execute("DELETE FROM email_verifications WHERE email = ?", (req.email.lower(),))
-        conn.commit()
-        conn.close()
-        raise HTTPException(400, "Code expired, please register again")
-
-    # Crear usuario
     try:
-        conn.execute(
-            "INSERT INTO users (username, email, password, plan, created_at) VALUES (?,?,?,?,?)",
-            (row["username"], row["email"], row["password"],
-             "free", datetime.now().isoformat()),
-        )
-        conn.commit()
-        user_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute("UPDATE email_verifications SET verified = 1 WHERE email = ?", (req.email.lower(),))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close()
-        raise HTTPException(400, "Username or email already exists")
-    finally:
-        conn.close()
+        user = User(username=v.username, email=v.email, password=v.password,
+                    email_verified=True)
+        db.add(user); db.flush()
+        v.verified = True
+        db.commit()
+    except Exception:
+        db.rollback(); raise HTTPException(400, "Username or email already exists")
 
-    MemoryStore(user_id, row["username"])
-    token = _make_token(user_id, row["username"])
-    return {"token": token, "username": row["username"], "plan": "free"}
+    MemoryStore(user.id, user.username)
+    return {"token": _make_token(user.id, user.username), "username": user.username, "plan": "free"}
+
 
 @app.post("/auth/resend-code")
-async def resend_code(email: str):
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM email_verifications WHERE email = ? AND verified = 0",
-        (email.lower(),)
-    ).fetchone()
-    conn.close()
-
-    if not row:
-        raise HTTPException(404, "No pending verification for this email")
-
-    code    = _generate_code()
-    expires = (datetime.now() + timedelta(minutes=10)).isoformat()
-    conn = get_db()
-    conn.execute(
-        "UPDATE email_verifications SET code = ?, expires_at = ? WHERE email = ?",
-        (code, expires, email.lower())
-    )
-    conn.commit()
-    conn.close()
-
-    send_verification_email(email, code, row["username"])
+async def resend_code(email: str, db: Session = Depends(get_db)):
+    v = db.query(EmailVerification).filter_by(email=email.lower(), verified=False).first()
+    if not v: raise HTTPException(404, "No pending verification")
+    v.code       = _generate_code()
+    v.expires_at = datetime.utcnow() + timedelta(minutes=10)
+    db.commit()
+    _send_verification_email(email, v.code, v.username)
     return {"status": "code_resent"}
 
-@app.post("/auth/login")
-async def login(req: LoginRequest):
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM users WHERE username = ? AND password = ?",
-        (req.username.lower(), _hash_password(req.password)),
-    ).fetchone()
-    if not row:
-        raise HTTPException(401, "Invalid username or password")
-    conn.execute(
-        "UPDATE users SET last_login = ? WHERE id = ?",
-        (datetime.now().isoformat(), row["id"]),
-    )
-    conn.commit()
-    conn.close()
 
-    token = _make_token(row["id"], row["username"])
-    return {"token": token, "username": row["username"], "plan": row["plan"]}
+@app.post("/auth/login")
+async def login(req: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter_by(
+        username=req.username.lower(), password=_hash_password(req.password)).first()
+    if not user: raise HTTPException(401, "Invalid username or password")
+    user.last_login = datetime.utcnow()
+    db.commit()
+    return {"token": _make_token(user.id, user.username), "username": user.username, "plan": user.plan}
+
 
 @app.get("/auth/me")
-async def me(user: dict = Depends(get_current_user)):
-    return {
-        "id": user["id"],
-        "username": user["username"],
-        "email": user["email"],
-        "plan": user["plan"],
-        "created_at": user["created_at"],
-        "last_login": user["last_login"],
-    }
+async def me(user: User = Depends(get_current_user)):
+    return {"id": user.id, "username": user.username, "email": user.email,
+            "plan": user.plan, "created_at": user.created_at, "last_login": user.last_login}
 
-def _notes_routes(app, get_db, get_current_user):
-    from fastapi import Depends, HTTPException
 
-    @app.get("/notes")
-    async def get_notes(user: dict = Depends(get_current_user)):
-        conn = get_db()
-        rows = conn.execute(
-            "SELECT * FROM notes WHERE user_id = ? ORDER BY pinned DESC, updated_at DESC",
-            (user["id"],)
-        ).fetchall()
-        conn.close()
-        return {"notes": [dict(r) for r in rows]}
+# ══════════════════════════════════════════════════════════════
+#  USAGE STATS
+# ══════════════════════════════════════════════════════════════
+@app.get("/usage")
+async def usage_stats(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return get_usage_stats(user.id, db)
 
-    @app.post("/notes")
-    async def create_note(req: NoteCreateRequest, user: dict = Depends(get_current_user)):
-        now = datetime.now().isoformat()
-        conn = get_db()
-        cur = conn.execute(
-            "INSERT INTO notes (user_id, title, content, color, pinned, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-            (user["id"], req.title, req.content, req.color, int(req.pinned), now, now)
-        )
-        conn.commit()
-        row = conn.execute("SELECT * FROM notes WHERE id = ?", (cur.lastrowid,)).fetchone()
-        conn.close()
-        return dict(row)
 
-    @app.put("/notes/{note_id}")
-    async def update_note(note_id: int, req: NoteUpdateRequest, user: dict = Depends(get_current_user)):
-        conn = get_db()
-        if not conn.execute("SELECT id FROM notes WHERE id=? AND user_id=?", (note_id, user["id"])).fetchone():
-            conn.close()
-            raise HTTPException(404, "Note not found")
-        updates = {k: v for k, v in req.dict().items() if v is not None}
-        if "pinned" in updates:
-            updates["pinned"] = int(updates["pinned"])
-        updates["updated_at"] = datetime.now().isoformat()
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
-        conn.execute(f"UPDATE notes SET {set_clause} WHERE id = ?", (*updates.values(), note_id))
-        conn.commit()
-        row = conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
-        conn.close()
-        return dict(row)
-
-    @app.delete("/notes/{note_id}")
-    async def delete_note(note_id: int, user: dict = Depends(get_current_user)):
-        conn = get_db()
-        conn.execute("DELETE FROM notes WHERE id = ? AND user_id = ?", (note_id, user["id"]))
-        conn.commit()
-        conn.close()
-        return {"status": "deleted"}
-
-def _tasks_routes(app, get_db, get_current_user):
-    from fastapi import Depends, HTTPException
-
-    @app.get("/tasks")
-    async def get_tasks(user: dict = Depends(get_current_user)):
-        conn = get_db()
-        rows = conn.execute(
-            "SELECT * FROM tasks WHERE user_id = ? ORDER BY completed ASC, due_date ASC, created_at DESC",
-            (user["id"],)
-        ).fetchall()
-        conn.close()
-        return {"tasks": [dict(r) for r in rows]}
-
-    @app.post("/tasks")
-    async def create_task(req: TaskCreateRequest, user: dict = Depends(get_current_user)):
-        now = datetime.now().isoformat()
-        conn = get_db()
-        cur = conn.execute(
-            "INSERT INTO tasks (user_id, title, description, priority, due_date, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-            (user["id"], req.title, req.description, req.priority, req.due_date, now, now)
-        )
-        conn.commit()
-        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (cur.lastrowid,)).fetchone()
-        conn.close()
-        return dict(row)
-
-    @app.put("/tasks/{task_id}")
-    async def update_task(task_id: int, req: TaskUpdateRequest, user: dict = Depends(get_current_user)):
-        conn = get_db()
-        if not conn.execute("SELECT id FROM tasks WHERE id=? AND user_id=?", (task_id, user["id"])).fetchone():
-            conn.close()
-            raise HTTPException(404, "Task not found")
-        updates = {k: v for k, v in req.dict().items() if v is not None}
-        if "completed" in updates:
-            updates["completed"] = int(updates["completed"])
-        updates["updated_at"] = datetime.now().isoformat()
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
-        conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", (*updates.values(), task_id))
-        conn.commit()
-        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        conn.close()
-        return dict(row)
-
-    @app.delete("/tasks/{task_id}")
-    async def delete_task(task_id: int, user: dict = Depends(get_current_user)):
-        conn = get_db()
-        conn.execute("DELETE FROM tasks WHERE id = ? AND user_id = ?", (task_id, user["id"]))
-        conn.commit()
-        conn.close()
-        return {"status": "deleted"}
-
-    @app.get("/reminders")
-    async def get_reminders(user: dict = Depends(get_current_user)):
-        conn = get_db()
-        rows = conn.execute(
-            "SELECT * FROM reminders WHERE user_id = ? AND completed = 0 ORDER BY reminder_time ASC",
-            (user["id"],)
-        ).fetchall()
-        conn.close()
-        return {"reminders": [dict(r) for r in rows]}
-
-# ═══════════════════════════ REMINDER ACK ENDPOINT ═════════════════════
-
-@app.post("/reminder/ack/{reminder_id}")
-async def ack_reminder(reminder_id: int, user: dict = Depends(get_current_user)):
-    conn = get_db()
-    row = conn.execute("SELECT user_id FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
-    if not row or row["user_id"] != user["id"]:
-        conn.close()
-        raise HTTPException(404, "Recordatorio no encontrado")
-    conn.close()
-    complete_reminder(reminder_id)
-    return {"status": "ok", "message": "Recordatorio confirmado"}
-
-# ═══════════════════════════ CHAT ROUTE ════════════════════════
-"""
-Chat con ollama
+# ══════════════════════════════════════════════════════════════
+#  CHAT (streaming SSE)
+# ══════════════════════════════════════════════════════════════
 @app.post("/chat")
-async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
+async def chat(req: ChatRequest, user: User = Depends(get_current_user),
+               db: Session = Depends(get_db)):
     if not req.message.strip():
         raise HTTPException(400, "Empty message")
 
-    user_id  = user["id"]
-    username = user["username"]
-    mem      = MemoryStore(user_id, username)
-    system   = build_system_prompt(user, mem)
+    # ── Rate limit & quota checks ─────────────────────────────
+    check_rate_limit(user, db)
+    check_token_quota(user, db)
 
-    messages = [{"role": "system", "content": system}]
-    messages.extend([{"role": m["role"], "content": m["content"]} for m in req.history[-20:]])
+    mem     = MemoryStore(user.id, user.username)
+    system  = build_system_prompt(user, mem)
+    messages = [{"role": m["role"], "content": m["content"]} for m in req.history[-20:]]
     messages.append({"role": "user", "content": req.message})
 
-    payload = {
-        "model":   MODEL_NAME,
-        "messages": messages,
-        "stream":  True,   # ← streaming activado
-        "options": {"temperature": 0.1, "top_p": 0.9},
-    }
-
     async def generate():
-        full_text = ""
+        full_text  = ""
+        token_count = 0
         try:
-            async with httpx.AsyncClient(timeout=180) as c:
-                async with c.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as r:
-                    async for line in r.aiter_lines():
-                        if not line.strip():
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                            token = chunk.get("message", {}).get("content", "")
-                            full_text += token
-                            # Enviar cada token como SSE
-                            yield f"data: {json.dumps({'token': token})}\n\n"
-                            if chunk.get("done"):
-                                break
-                        except json.JSONDecodeError:
-                            continue
-
-            # Post-procesamiento una vez terminado el stream
-            clean_text, memory_updated = parse_and_apply_action(full_text, user_id, mem)
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            clean_text = clean_text.replace("[CURRENT_TIME]", now_str)
-            final_response = check_and_send_reminders_in_chat(user_id, clean_text)
-            mem.append_history(req.message, final_response)
-
-            # Evento final con metadata
-            yield f"data: {json.dumps({'done': True, 'response': final_response, 'memory_updated': memory_updated})}\n\n"
-
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control":               "no-cache",
-            "X-Accel-Buffering":           "no",   # importante para nginx
-            "Access-Control-Allow-Origin": "*",
-        },
-    )
-""" 
-
-@app.post("/chat")
-async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
-    if not req.message.strip():
-        raise HTTPException(400, "Empty message")
-
-    user_id  = user["id"]
-    username = user["username"]
-    mem      = MemoryStore(user_id, username)
-    system   = build_system_prompt(user, mem)
-
-    # Nota: Groq ya maneja el historial dentro de los mensajes, 
-    # pero tu lógica de build_system_prompt ya lo incluye en el texto.
-    # Por lo tanto, pasamos el mensaje directo para evitar redundancia.
-
-    async def generate():
-        full_text = ""
-        try:
-            # Llamamos a nuestra función de streaming de Groq
-            async for token in call_groq_stream(req.message, system):
-                full_text += token
-                # Enviar cada token a Flutter
+            async for token in stream_ai(messages, system):
+                full_text   += token
+                token_count += 1
                 yield f"data: {json.dumps({'token': token})}\n\n"
 
-            # --- Post-procesamiento (Igual que antes pero optimizado) ---
-            # 1. Ejecutar acciones (Memoria, Recordatorios, Búsqueda Web)
-            clean_text, memory_updated = parse_and_apply_action(full_text, user_id, mem)
-            
-            # 2. Reemplazar tiempo
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            clean_text = clean_text.replace("[CURRENT_TIME]", now_str)
-            
-            # 3. Revisar recordatorios y guardar historial
-            final_response = check_and_send_reminders_in_chat(user_id, clean_text)
-            mem.append_history(req.message, final_response)
+            # Post-process
+            clean, memory_updated = parse_and_apply_action(full_text, user.id, mem, db)
+            final = check_and_inject_reminders(user.id, clean, db)
+            mem.append_history(req.message, final)
 
-            # 4. Evento final con la respuesta limpia y acciones aplicadas
-            yield f"data: {json.dumps({'done': True, 'response': final_response, 'memory_updated': memory_updated})}\n\n"
+            # Record usage (estimate input + output tokens)
+            input_tokens  = estimate_tokens(req.message + system)
+            output_tokens = estimate_tokens(full_text)
+            record_token_usage(user.id, input_tokens + output_tokens, db)
 
+            yield f"data: {json.dumps({'done': True, 'response': final, 'memory_updated': memory_updated})}\n\n"
+
+        except HTTPException as e:
+            # Quota / rate limit — surface to client cleanly
+            yield f"data: {json.dumps({'error': e.detail, 'status': e.status_code})}\n\n"
         except Exception as e:
-            logger.error(f"Error en streaming de Groq: {e}")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            logger.error(f"Chat stream error: {e}", exc_info=True)
+            yield f"data: {json.dumps({'error': {'message': 'AI service unavailable. Please try again in a moment.', 'type': 'ai_error'}})}\n\n"
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control":               "no-cache",
-            "X-Accel-Buffering":           "no",
-            "Access-Control-Allow-Origin": "*",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "Access-Control-Allow-Origin": "*"},
     )
 
-# ═══════════════════════════ MEMORY ROUTES ═════════════════════
 
+# ══════════════════════════════════════════════════════════════
+#  STRIPE PAYMENTS
+# ══════════════════════════════════════════════════════════════
+@app.post("/billing/checkout")
+async def create_checkout(req: CheckoutRequest, user: User = Depends(get_current_user),
+                          db: Session = Depends(get_db)):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Payments not configured")
+    plan = req.plan.lower()
+    if plan not in ("basic", "premium"):
+        raise HTTPException(400, "Invalid plan")
+    price_id = PLAN_QUOTAS[plan]["price_id"]
+    if not price_id:
+        raise HTTPException(503, f"Price ID for {plan} not configured")
+
+    # Create or reuse Stripe customer
+    customer_id = user.stripe_customer_id
+    if not customer_id:
+        customer    = stripe.Customer.create(email=user.email, name=user.username,
+                                              metadata={"user_id": user.id})
+        customer_id = customer.id
+        user.stripe_customer_id = customer_id
+        db.commit()
+
+    session = stripe.checkout.Session.create(
+        customer=customer_id,
+        payment_method_types=["card"],
+        line_items=[{"price": price_id, "quantity": 1}],
+        mode="subscription",
+        success_url=f"{FRONTEND_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{FRONTEND_URL}/billing/cancel",
+        metadata={"user_id": str(user.id), "plan": plan},
+    )
+    return {"url": session.url, "session_id": session.id}
+
+
+@app.post("/billing/portal")
+async def billing_portal(user: User = Depends(get_current_user)):
+    """Opens Stripe Customer Portal for managing/cancelling subscriptions."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Payments not configured")
+    if not user.stripe_customer_id:
+        raise HTTPException(400, "No billing account found")
+    session = stripe.billing_portal.Session.create(
+        customer=user.stripe_customer_id,
+        return_url=f"{FRONTEND_URL}/profile",
+    )
+    return {"url": session.url}
+
+
+@app.post("/billing/webhook")
+async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
+    """Handles Stripe events to update user plan."""
+    payload   = await request.body()
+    sig       = request.headers.get("stripe-signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(400, "Invalid signature")
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+    etype = event["type"]
+    data  = event["data"]["object"]
+
+    if etype == "checkout.session.completed":
+        user_id = int(data["metadata"].get("user_id", 0))
+        plan    = data["metadata"].get("plan", "free")
+        sub_id  = data.get("subscription")
+        user    = db.query(User).filter_by(id=user_id).first()
+        if user:
+            user.plan                   = plan
+            user.stripe_subscription_id = sub_id
+            db.commit()
+            logger.info(f"User {user_id} upgraded to {plan}")
+
+    elif etype in ("customer.subscription.deleted", "customer.subscription.paused"):
+        sub_id = data["id"]
+        user   = db.query(User).filter_by(stripe_subscription_id=sub_id).first()
+        if user:
+            user.plan                   = "free"
+            user.stripe_subscription_id = None
+            db.commit()
+            logger.info(f"User {user.id} downgraded to free (sub {sub_id} {etype})")
+
+    elif etype == "customer.subscription.updated":
+        sub_id = data["id"]
+        user   = db.query(User).filter_by(stripe_subscription_id=sub_id).first()
+        if user:
+            # Map Stripe price ID back to plan
+            items    = data.get("items", {}).get("data", [])
+            price_id = items[0]["price"]["id"] if items else ""
+            for plan_name, pdata in PLAN_QUOTAS.items():
+                if pdata.get("price_id") == price_id:
+                    user.plan = plan_name; break
+            db.commit()
+
+    elif etype == "invoice.payment_failed":
+        customer_id = data.get("customer")
+        user = db.query(User).filter_by(stripe_customer_id=customer_id).first()
+        if user:
+            logger.warning(f"Payment failed for user {user.id}")
+            # Optionally send email notification here
+
+    return {"status": "ok"}
+
+
+@app.get("/billing/plans")
+async def get_plans():
+    """Returns available plans and pricing info."""
+    return {
+        "plans": [
+            {
+                "id":           "free",
+                "label":        "Free",
+                "price":        0,
+                "daily_tokens": PLAN_QUOTAS["free"]["daily_tokens"],
+                "rpm":          PLAN_QUOTAS["free"]["rpm"],
+                "rpd":          PLAN_QUOTAS["free"]["rpd"],
+                "features":     ["10K tokens/day", "5 req/min", "Basic memory"],
+            },
+            {
+                "id":           "basic",
+                "label":        "Basic",
+                "price":        9.99,
+                "daily_tokens": PLAN_QUOTAS["basic"]["daily_tokens"],
+                "rpm":          PLAN_QUOTAS["basic"]["rpm"],
+                "rpd":          PLAN_QUOTAS["basic"]["rpd"],
+                "features":     ["100K tokens/day", "20 req/min", "Full memory", "Priority support"],
+                "price_id":     STRIPE_PRICE_BASIC,
+            },
+            {
+                "id":           "premium",
+                "label":        "Premium",
+                "price":        24.99,
+                "daily_tokens": PLAN_QUOTAS["premium"]["daily_tokens"],
+                "rpm":          PLAN_QUOTAS["premium"]["rpm"],
+                "rpd":          PLAN_QUOTAS["premium"]["rpd"],
+                "features":     ["500K tokens/day", "60 req/min", "Full memory", "Priority AI", "Early access"],
+                "price_id":     STRIPE_PRICE_PREMIUM,
+            },
+        ]
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+#  MEMORY ROUTES
+# ══════════════════════════════════════════════════════════════
 @app.get("/memory")
-async def get_memory(user: dict = Depends(get_current_user)):
-    mem = MemoryStore(user["id"], user["username"])
-    return {"memory": mem.read_memory()}
+async def get_memory(user: User = Depends(get_current_user)):
+    return {"memory": MemoryStore(user.id, user.username).read_memory()}
 
 @app.put("/memory")
-async def write_memory(req: MemoryWriteRequest, user: dict = Depends(get_current_user)):
-    mem = MemoryStore(user["id"], user["username"])
-    mem.write_memory(req.content)
+async def write_memory(req: MemoryWriteRequest, user: User = Depends(get_current_user)):
+    MemoryStore(user.id, user.username).write_memory(req.content)
     return {"status": "saved"}
 
 @app.patch("/memory")
-async def patch_memory(req: MemoryPatchRequest, user: dict = Depends(get_current_user)):
-    mem = MemoryStore(user["id"], user["username"])
-    ok = mem.patch_memory(req.old_text, req.new_text)
-    if not ok:
-        raise HTTPException(400, "Text not found in memory")
+async def patch_memory(req: MemoryPatchRequest, user: User = Depends(get_current_user)):
+    ok = MemoryStore(user.id, user.username).patch_memory(req.old_text, req.new_text)
+    if not ok: raise HTTPException(400, "Text not found in memory")
     return {"status": "patched"}
 
 @app.delete("/memory")
-async def clear_memory(user: dict = Depends(get_current_user)):
-    mem = MemoryStore(user["id"], user["username"])
-    mem.write_memory(
-        "# ARIA Long-Term Memory\n\n"
-        "## User Information\n\n"
-        "## Preferences\n\n"
-        "## Ongoing Tasks\n\n"
-        "## Important Notes\n\n"
-    )
-    return {"status": "memory cleared"}
+async def clear_memory(user: User = Depends(get_current_user)):
+    MemoryStore(user.id, user.username).write_memory(
+        "# ARIA Long-Term Memory\n\n## User Information\n\n"
+        "## Preferences\n\n## Ongoing Tasks\n\n## Important Notes\n\n")
+    return {"status": "cleared"}
 
 @app.get("/memory/history")
-async def get_history(limit: int = 30, user: dict = Depends(get_current_user)):
-    mem = MemoryStore(user["id"], user["username"])
-    return {"history": mem.read_history(last_n=limit)}
+async def get_history(limit: int = 30, user: User = Depends(get_current_user)):
+    return {"history": MemoryStore(user.id, user.username).read_history(last_n=limit)}
 
 @app.delete("/memory/history")
-async def clear_history(user: dict = Depends(get_current_user)):
-    mem = MemoryStore(user["id"], user["username"])
-    mem.history_file.write_text("# ARIA Conversation History\n\n", encoding="utf-8")
-    return {"status": "history cleared"}
+async def clear_history(user: User = Depends(get_current_user)):
+    MemoryStore(user.id, user.username).history_file.write_text(
+        "# ARIA Conversation History\n\n", encoding="utf-8")
+    return {"status": "cleared"}
 
-_notes_routes(app, get_db, get_current_user)
-_tasks_routes(app, get_db, get_current_user)
 
-# ═══════════════════════════ HEALTH ════════════════════════════
+# ══════════════════════════════════════════════════════════════
+#  NOTES
+# ══════════════════════════════════════════════════════════════
+def _note_dict(n: Note) -> dict:
+    return {"id": n.id, "user_id": n.user_id, "title": n.title, "content": n.content,
+            "color": n.color, "pinned": n.pinned,
+            "created_at": n.created_at.isoformat(), "updated_at": n.updated_at.isoformat()}
 
+@app.get("/notes")
+async def get_notes(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    notes = db.query(Note).filter_by(user_id=user.id).order_by(
+        Note.pinned.desc(), Note.updated_at.desc()).all()
+    return {"notes": [_note_dict(n) for n in notes]}
+
+@app.post("/notes")
+async def create_note(req: NoteCreateRequest, user: User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    n = Note(user_id=user.id, title=req.title, content=req.content,
+             color=req.color, pinned=req.pinned)
+    db.add(n); db.commit(); db.refresh(n)
+    return _note_dict(n)
+
+@app.put("/notes/{note_id}")
+async def update_note(note_id: int, req: NoteUpdateRequest,
+                      user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    n = db.query(Note).filter_by(id=note_id, user_id=user.id).first()
+    if not n: raise HTTPException(404, "Note not found")
+    for k, v in req.dict(exclude_none=True).items(): setattr(n, k, v)
+    n.updated_at = datetime.utcnow()
+    db.commit(); db.refresh(n)
+    return _note_dict(n)
+
+@app.delete("/notes/{note_id}")
+async def delete_note(note_id: int, user: User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    n = db.query(Note).filter_by(id=note_id, user_id=user.id).first()
+    if not n: raise HTTPException(404, "Note not found")
+    db.delete(n); db.commit()
+    return {"status": "deleted"}
+
+
+# ══════════════════════════════════════════════════════════════
+#  TASKS
+# ══════════════════════════════════════════════════════════════
+def _task_dict(t: Task) -> dict:
+    return {"id": t.id, "user_id": t.user_id, "title": t.title,
+            "description": t.description, "completed": t.completed,
+            "priority": t.priority, "due_date": t.due_date,
+            "created_at": t.created_at.isoformat(), "updated_at": t.updated_at.isoformat()}
+
+@app.get("/tasks")
+async def get_tasks(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    tasks = db.query(Task).filter_by(user_id=user.id).order_by(
+        Task.completed, Task.due_date, Task.created_at.desc()).all()
+    return {"tasks": [_task_dict(t) for t in tasks]}
+
+@app.post("/tasks")
+async def create_task(req: TaskCreateRequest, user: User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    t = Task(user_id=user.id, title=req.title, description=req.description,
+             priority=req.priority, due_date=req.due_date)
+    db.add(t); db.commit(); db.refresh(t)
+    return _task_dict(t)
+
+@app.put("/tasks/{task_id}")
+async def update_task(task_id: int, req: TaskUpdateRequest,
+                      user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    t = db.query(Task).filter_by(id=task_id, user_id=user.id).first()
+    if not t: raise HTTPException(404, "Task not found")
+    for k, v in req.dict(exclude_none=True).items(): setattr(t, k, v)
+    t.updated_at = datetime.utcnow()
+    db.commit(); db.refresh(t)
+    return _task_dict(t)
+
+@app.delete("/tasks/{task_id}")
+async def delete_task(task_id: int, user: User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    t = db.query(Task).filter_by(id=task_id, user_id=user.id).first()
+    if not t: raise HTTPException(404, "Task not found")
+    db.delete(t); db.commit()
+    return {"status": "deleted"}
+
+
+# ══════════════════════════════════════════════════════════════
+#  REMINDERS
+# ══════════════════════════════════════════════════════════════
+def _rem_dict(r: Reminder) -> dict:
+    return {"id": r.id, "user_id": r.user_id, "reminder_text": r.reminder_text,
+            "reminder_time": r.reminder_time, "recurrence": r.recurrence,
+            "sent": r.sent, "completed": r.completed}
+
+@app.get("/reminders")
+async def get_reminders(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    rows = db.query(Reminder).filter_by(user_id=user.id, completed=False).order_by(
+        Reminder.reminder_time).all()
+    return {"reminders": [_rem_dict(r) for r in rows]}
+
+@app.post("/reminder/ack/{reminder_id}")
+async def ack_reminder(reminder_id: int, user: User = Depends(get_current_user),
+                       db: Session = Depends(get_db)):
+    r = db.query(Reminder).filter_by(id=reminder_id, user_id=user.id).first()
+    if not r: raise HTTPException(404, "Reminder not found")
+    r.completed = True
+    db.commit()
+    return {"status": "ok"}
+
+
+# ══════════════════════════════════════════════════════════════
+#  HEALTH
+# ══════════════════════════════════════════════════════════════
 @app.get("/health")
 async def health():
+    ollama_ok   = False
+    model_ready = False
     try:
         async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.get(f"{OLLAMA_URL}/api/tags")
+            r    = await c.get(f"{OLLAMA_URL}/api/tags")
             tags = r.json().get("models", [])
+            ollama_ok   = True
             model_ready = any(MODEL_NAME in m.get("name", "") for m in tags)
     except Exception:
-        return {"status": "ok", "aria": "online", "ollama": "disconnected",
-                "model": MODEL_NAME, "model_ready": False}
-
+        pass
     return {
-        "status": "ok",
-        "aria": "online",
-        "ollama": "connected",
-        "model": MODEL_NAME,
+        "status":      "ok",
+        "aria":        "online",
+        "ollama":      "connected" if ollama_ok else "disconnected",
+        "model":       MODEL_NAME,
         "model_ready": model_ready,
+        "groq":        "configured" if GROQ_API_KEY else "not_configured",
+        "stripe":      "configured" if STRIPE_SECRET_KEY else "not_configured",
     }
 
-# ═══════════════════════════ ENTRY POINT ═══════════════════════
 
+# ══════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
