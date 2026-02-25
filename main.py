@@ -367,14 +367,12 @@ def get_usage_stats(user_id: int, db: Session) -> dict:
 def _hash_password(password: str) -> str:
     return hmac.new(SECRET_KEY.encode(), password.encode(), hashlib.sha256).hexdigest()
 
-
 def _make_token(user_id: int, username: str) -> str:
     import base64
     payload = json.dumps({"id": user_id, "u": username, "exp": int(time.time()) + 86400 * 30})
     b64 = base64.urlsafe_b64encode(payload.encode()).decode()
     sig = hmac.new(SECRET_KEY.encode(), b64.encode(), hashlib.sha256).hexdigest()[:16]
     return f"{b64}.{sig}"
-
 
 def _verify_token(token: str) -> dict:
     import base64
@@ -390,9 +388,7 @@ def _verify_token(token: str) -> dict:
     except (ValueError, KeyError, json.JSONDecodeError):
         raise HTTPException(401, "Invalid token")
 
-
 bearer = HTTPBearer()
-
 
 def get_current_user(
     creds: HTTPAuthorizationCredentials = Depends(bearer),
@@ -412,16 +408,22 @@ def get_current_user(
 def _generate_code() -> str:
     return "".join(random.choices(string.digits, k=6))
 
-
 def _send_verification_email(email: str, code: str, username: str) -> bool:
+    """
+    Envía un correo de verificación usando SMTP_SSL (Puerto 465).
+    Incluye un timeout de 10s para evitar que el servidor se bloquee.
+    """
     if not SMTP_USER or not SMTP_PASSWORD:
-        logger.warning("SMTP not configured — skipping email (dev mode)")
+        logger.warning("⚠️ SMTP no configurado — saltando envío de email (Modo Dev)")
         return True
+
     try:
-        msg          = MIMEMultipart("alternative")
-        msg["From"]  = SMTP_FROM
-        msg["To"]    = email
+        # 1. Construcción del Mensaje
+        msg = MIMEMultipart("alternative")
+        msg["From"] = SMTP_FROM
+        msg["To"] = email
         msg["Subject"] = "🔐 Your ARIA verification code"
+
         html = f"""
         <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px">
           <h1 style="font-size:28px;font-weight:900;color:#6C63FF;letter-spacing:-1px;margin:0">ARIA</h1>
@@ -434,16 +436,25 @@ def _send_verification_email(email: str, code: str, username: str) -> bool:
             <p style="color:#8B8FA8;font-size:12px;margin:20px 0 0">Expires in <strong>10 minutes</strong>.</p>
           </div>
         </div>"""
+        
         msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.starttls()
+
+        # 2. Configuración Segura de SSL
+        context = ssl.create_default_context()
+
+        # 3. Conexión y Envío (Con SMTP_SSL y Timeout)
+        # Nota: Usamos timeout=10 para que Flutter no reciba un Timeout si Gmail tarda en responder
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=10) as s:
             s.login(SMTP_USER, SMTP_PASSWORD)
             s.send_message(msg)
+            
+        logger.info(f"✅ Email enviado exitosamente a {email}")
         return True
-    except Exception as e:
-        logger.error(f"Email error: {e}")
-        return False
 
+    except Exception as e:
+        # Logueamos el error pero retornamos False para que el servidor NO se apague
+        logger.error(f"❌ Error en el servicio de Email: {e}")
+        return False
 
 def _send_reminder_email(email: str, text_: str, time_: str) -> bool:
     if not SMTP_USER or not SMTP_PASSWORD:
@@ -469,7 +480,6 @@ def _send_reminder_email(email: str, text_: str, time_: str) -> bool:
 #  WEBSOCKET
 # ══════════════════════════════════════════════════════════════
 active_connections: Dict[int, List[WebSocket]] = defaultdict(list)
-
 
 async def _ws_send_reminder(user_id: int, text_: str, time_: str) -> bool:
     if user_id not in active_connections or not active_connections[user_id]:
