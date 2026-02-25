@@ -47,7 +47,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s │ %(levelname)s �
 logger = logging.getLogger(__name__)
 
 DATA_DIR   = Path(os.getenv("ARIA_DATA",   "aria_data"));  DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_URL     = os.getenv("ARIA_DB_URL",   f"sqlite:///{DATA_DIR}/aria.db")
+DB_URL = os.getenv("ARIA_DB_URL")
 SECRET_KEY = os.getenv("ARIA_SECRET",   "CHANGE_ME_IN_PRODUCTION_2024")
 OLLAMA_URL = os.getenv("OLLAMA_URL",    "http://localhost:11434")
 MODEL_NAME = os.getenv("ARIA_MODEL",    "qwen2.5:7b")
@@ -95,9 +95,20 @@ PLAN_QUOTAS: Dict[str, Dict] = {
 # ══════════════════════════════════════════════════════════════
 #  DATABASE — SQLAlchemy
 # ══════════════════════════════════════════════════════════════
+if DB_URL:
+    # Render entrega postgres:// pero SQLAlchemy 2.0 REQUIERE postgresql://
+    if DB_URL.startswith("postgres://"):
+        DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+    else:
+        DB_URL = DB_URL
+else:
+    # Fallback a SQLite solo si no hay variable
+    DB_URL = f"sqlite:///{DATA_DIR}/aria.db"
+
 engine = create_engine(
     DB_URL,
     connect_args={"check_same_thread": False} if "sqlite" in DB_URL else {},
+    pool_pre_ping=True,
     echo=False,
 )
 
