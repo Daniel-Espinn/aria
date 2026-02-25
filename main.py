@@ -7,7 +7,6 @@ import hmac
 import json
 import logging
 import os
-import ssl
 import random
 import re
 import smtplib
@@ -410,51 +409,33 @@ def _generate_code() -> str:
     return "".join(random.choices(string.digits, k=6))
 
 def _send_verification_email(email: str, code: str, username: str) -> bool:
-    """
-    Envía un correo de verificación usando SMTP_SSL (Puerto 465).
-    Incluye un timeout de 10s para evitar que el servidor se bloquee.
-    """
-    if not SMTP_USER or not SMTP_PASSWORD:
-        logger.warning("⚠️ SMTP no configurado — saltando envío de email (Modo Dev)")
+    user = os.getenv("SMTP_USER")
+    password = os.getenv("SMTP_PASSWORD")
+    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    port = int(os.getenv("SMTP_PORT", "587")) # Puerto estándar
+
+    if not user or not password:
+        logger.warning("SMTP no configurado — el usuario se creará sin verificar.")
         return True
 
     try:
-        # 1. Construcción del Mensaje
         msg = MIMEMultipart("alternative")
-        msg["From"] = SMTP_FROM
+        msg["From"] = os.getenv("SMTP_FROM", user)
         msg["To"] = email
-        msg["Subject"] = "🔐 Your ARIA verification code"
-
-        html = f"""
-        <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px">
-          <h1 style="font-size:28px;font-weight:900;color:#6C63FF;letter-spacing:-1px;margin:0">ARIA</h1>
-          <p style="color:#8B8FA8;font-size:13px;margin-top:4px">Adaptive Reasoning Intelligence Architecture</p>
-          <div style="background:#F8F8FF;border-radius:16px;padding:32px;text-align:center;border:1px solid #E8E8F0;margin-top:24px">
-            <p style="color:#2C2C3E;font-size:15px;margin:0 0 20px">Hi <strong>{username}</strong>, your code is:</p>
-            <div style="background:#6C63FF;border-radius:12px;padding:18px 40px;display:inline-block">
-              <span style="color:white;font-size:36px;font-weight:900;letter-spacing:10px">{code}</span>
-            </div>
-            <p style="color:#8B8FA8;font-size:12px;margin:20px 0 0">Expires in <strong>10 minutes</strong>.</p>
-          </div>
-        </div>"""
+        msg["Subject"] = "Código Aria"
         
-        msg.attach(MIMEText(html, "html"))
-
-        # 2. Configuración Segura de SSL
-        context = ssl.create_default_context()
-
-        # 3. Conexión y Envío (Con SMTP_SSL y Timeout)
-        # Nota: Usamos timeout=10 para que Flutter no reciba un Timeout si Gmail tarda en responder
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=10) as s:
-            s.login(SMTP_USER, SMTP_PASSWORD)
+        msg.attach(MIMEText(f"Tu código es: {code}", "plain"))
+        
+        with smtplib.SMTP(host, port, timeout=5) as s:
+            s.starttls() # Intenta subir a conexión segura si es posible
+            s.login(user, password)
             s.send_message(msg)
             
-        logger.info(f"✅ Email enviado exitosamente a {email}")
+        logger.info(f"✅ Email enviado a {email}")
         return True
 
     except Exception as e:
-        # Logueamos el error pero retornamos False para que el servidor NO se apague
-        logger.error(f"❌ Error en el servicio de Email: {e}")
+        logger.error(f"⚠️ El correo no se pudo enviar, pero el registro continúa: {e}")
         return False
 
 def _send_reminder_email(email: str, text_: str, time_: str) -> bool:
