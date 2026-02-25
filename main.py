@@ -95,9 +95,13 @@ PLAN_QUOTAS: Dict[str, Dict] = {
 # ══════════════════════════════════════════════════════════════
 #  DATABASE — SQLAlchemy
 # ══════════════════════════════════════════════════════════════
+if DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+
 engine = create_engine(
     DB_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DB_URL else {},
+    # El argumento check_same_thread SOLO es para SQLite
+    connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {},
     echo=False,
 )
 
